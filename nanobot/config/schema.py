@@ -208,6 +208,15 @@ class ProviderConfig(Base):
         return v
 
 
+class OpenAICodexProviderConfig(ProviderConfig):
+    """OpenAI Codex provider configuration."""
+
+    proxy: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )  # Optional proxy URL for Codex OAuth and Responses requests
+
+
 class BedrockProviderConfig(ProviderConfig):
     """AWS Bedrock Runtime provider configuration."""
 
@@ -259,7 +268,7 @@ class ProvidersConfig(Base):
     volcengine_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine Coding Plan
     byteplus: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus (VolcEngine international)
     byteplus_coding_plan: ProviderConfig = Field(default_factory=ProviderConfig)  # BytePlus Coding Plan
-    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
+    openai_codex: OpenAICodexProviderConfig = Field(default_factory=OpenAICodexProviderConfig, exclude=True)  # OpenAI Codex (OAuth)
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig, exclude=True)  # Github Copilot (OAuth)
     qianfan: ProviderConfig = Field(default_factory=ProviderConfig)  # Qianfan (百度千帆)
     nvidia: ProviderConfig = Field(default_factory=ProviderConfig)  # NVIDIA NIM (nvapi- keys)

@@ -79,9 +79,20 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = config.model_dump(mode="json", by_alias=True)
+    _include_explicit_oauth_provider_configs(data, config)
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _include_explicit_oauth_provider_configs(data: dict[str, Any], config: Config) -> None:
+    """Persist supported non-secret OAuth provider settings hidden by exclude=True."""
+    codex_proxy = config.providers.openai_codex.proxy
+    if codex_proxy is None:
+        return
+
+    providers = data.setdefault("providers", {})
+    providers["openaiCodex"] = {"proxy": codex_proxy}
 
 
 _ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")

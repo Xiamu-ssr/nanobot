@@ -3,8 +3,10 @@ import json
 import re
 import shutil
 import signal
+import sys
 from contextlib import suppress
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,7 +21,7 @@ from nanobot.cron.service import CronJobSkippedError
 from nanobot.cron.session_turns import CRON_DEFER_UNTIL_IDLE_META, CRON_TRIGGER_META
 from nanobot.cron.types import CronJob, CronPayload
 from nanobot.cron.webui_metadata import cron_proactive_delivery_metadata
-from nanobot.providers.factory import ProviderSnapshot, make_provider
+from nanobot.providers.factory import ProviderSnapshot, make_provider, provider_signature
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
 from nanobot.webui.metadata import (
@@ -434,6 +436,127 @@ def test_provider_login_rejects_unknown_provider():
     assert "Unknown OAuth provider" in result.stdout
 
 
+def test_provider_login_openai_codex_uses_nonblocking_helper(monkeypatch):
+    fake_oauth = ModuleType("oauth_cli_kit")
+
+    def fake_get_token():
+        raise RuntimeError("refresh_token_reused")
+
+    fake_oauth.get_token = fake_get_token
+    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: Config())
+
+    called = False
+
+    def fake_login(*, print_fn, prompt_fn, proxy=None):
+        nonlocal called
+        assert proxy is None
+        called = True
+        return SimpleNamespace(access="access-token", account_id="acct-test")
+
+    monkeypatch.setattr(cli_commands, "_login_openai_codex_interactive", fake_login)
+
+    result = runner.invoke(app, ["provider", "login", "openai-codex"])
+
+    assert result.exit_code == 0
+    assert called is True
+    assert "Authenticated with OpenAI Codex" in result.stdout
+    assert "acct-test" in result.stdout
+
+
+def test_provider_login_openai_codex_passes_configured_proxy(monkeypatch):
+    proxy = "http://127.0.0.1:23458"
+    fake_oauth = ModuleType("oauth_cli_kit")
+
+    def fake_get_token():
+        raise RuntimeError("no-token")
+
+    fake_oauth.get_token = fake_get_token
+    monkeypatch.setitem(sys.modules, "oauth_cli_kit", fake_oauth)
+    monkeypatch.setattr(
+        "nanobot.config.loader.load_config",
+        lambda: Config.model_validate({"providers": {"openaiCodex": {"proxy": proxy}}}),
+    )
+
+    captured: dict[str, str | None] = {}
+
+    def fake_login(*, print_fn, prompt_fn, proxy=None):
+        captured["proxy"] = proxy
+        return SimpleNamespace(access="access-token", account_id="acct-test")
+
+    monkeypatch.setattr(cli_commands, "_login_openai_codex_interactive", fake_login)
+
+    result = runner.invoke(app, ["provider", "login", "openai-codex"])
+
+    assert result.exit_code == 0
+    assert captured["proxy"] == proxy
+
+
+@pytest.mark.asyncio
+async def test_openai_codex_token_exchange_uses_explicit_httpx_proxy(monkeypatch):
+    import httpx
+
+    proxy = "http://127.0.0.1:23458"
+    seen: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, data, headers):
+            seen["post"] = {"url": url, "data": data, "headers": headers}
+            return SimpleNamespace(
+                status_code=200,
+                text="",
+                json=lambda: {
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "expires_in": 3600,
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    provider = SimpleNamespace(
+        client_id="client-id",
+        token_url="https://auth.example/token",
+        redirect_uri="http://localhost:1455/auth/callback",
+        jwt_claim_path=None,
+        account_id_claim=None,
+    )
+
+    token = await cli_commands._exchange_openai_codex_code_for_token(
+        "auth-code",
+        "verifier",
+        provider,
+        proxy=proxy,
+    )
+
+    assert token.access == "access-token"
+    assert token.refresh == "refresh-token"
+    assert seen["client_kwargs"] == {
+        "timeout": cli_commands._CODEX_OAUTH_EXCHANGE_TIMEOUT_S,
+        "proxy": proxy,
+        "trust_env": False,
+    }
+    assert seen["post"] == {
+        "url": "https://auth.example/token",
+        "data": {
+            "grant_type": "authorization_code",
+            "client_id": "client-id",
+            "code": "auth-code",
+            "code_verifier": "verifier",
+            "redirect_uri": "http://localhost:1455/auth/callback",
+        },
+        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+    }
+
+
 def test_config_matches_explicit_ollama_prefix_without_api_key():
     config = Config()
     config.agents.defaults.model = "ollama/llama3.2"
@@ -683,6 +806,58 @@ def test_make_provider_uses_github_copilot_backend():
         provider = make_provider(config)
 
     assert provider.__class__.__name__ == "GitHubCopilotProvider"
+
+
+def test_make_provider_uses_openai_codex_proxy_config():
+    proxy = "http://127.0.0.1:23458"
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "provider": "openai-codex",
+                    "model": "openai-codex/gpt-5.5",
+                }
+            },
+            "providers": {
+                "openaiCodex": {
+                    "proxy": proxy,
+                }
+            },
+        }
+    )
+
+    provider = make_provider(config)
+
+    assert provider.__class__.__name__ == "OpenAICodexProvider"
+    assert provider.proxy == proxy
+
+
+def test_provider_signature_tracks_openai_codex_proxy_config():
+    base = {
+        "agents": {
+            "defaults": {
+                "provider": "openai-codex",
+                "model": "openai-codex/gpt-5.5",
+            }
+        },
+        "providers": {
+            "openaiCodex": {
+                "proxy": "http://127.0.0.1:23458",
+            }
+        },
+    }
+    changed = {
+        **base,
+        "providers": {
+            "openaiCodex": {
+                "proxy": "http://127.0.0.1:23459",
+            }
+        },
+    }
+
+    assert provider_signature(Config.model_validate(base)) != provider_signature(
+        Config.model_validate(changed)
+    )
 
 
 def test_github_copilot_provider_strips_prefixed_model_name():

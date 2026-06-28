@@ -79,7 +79,10 @@ def _make_provider_core(
     if backend == "openai_codex":
         from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
-        provider = OpenAICodexProvider(default_model=model)
+        provider = OpenAICodexProvider(
+            default_model=model,
+            proxy=getattr(p, "proxy", None) if p else None,
+        )
     elif backend == "azure_openai":
         from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
 
@@ -218,6 +221,7 @@ def provider_signature(
             fallback.temperature,
             fallback.reasoning_effort,
             fallback.context_window_tokens,
+            getattr(fp, "proxy", None) if fp else None,
         )
 
     provider_name = config.get_provider_name(resolved.model, preset=resolved)
@@ -237,6 +241,7 @@ def provider_signature(
         resolved.temperature,
         resolved.reasoning_effort,
         resolved.context_window_tokens,
+        getattr(p, "proxy", None) if p else None,
         tuple(_fallback_signature(fallback) for fallback in fallback_presets),
     )
 

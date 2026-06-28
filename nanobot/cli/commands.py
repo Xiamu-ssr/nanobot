@@ -1743,6 +1743,8 @@ _PROVIDER_DISPLAY: dict[str, str] = {
     "openai_codex": "OpenAI Codex",
     "github_copilot": "GitHub Copilot",
 }
+_CODEX_OAUTH_CALLBACK_TIMEOUT_S = 120.0
+_CODEX_OAUTH_EXCHANGE_TIMEOUT_S = 45.0
 
 
 def _register_login(name: str):
@@ -1773,6 +1775,205 @@ def _resolve_oauth_provider(provider: str):
         console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
         raise typer.Exit(1)
     return spec
+
+
+async def _exchange_openai_codex_code_for_token(
+    code: str,
+    verifier: str,
+    provider: Any,
+    *,
+    proxy: str | None,
+):
+    """Exchange a Codex OAuth code using an explicit proxy when configured."""
+    import time
+
+    import httpx
+    from oauth_cli_kit.flow import _decode_account_id, _parse_token_payload
+    from oauth_cli_kit.models import OAuthToken
+
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": provider.client_id,
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": provider.redirect_uri,
+    }
+    async with httpx.AsyncClient(
+        timeout=_CODEX_OAUTH_EXCHANGE_TIMEOUT_S,
+        proxy=proxy,
+        trust_env=proxy is None,
+    ) as client:
+        response = await client.post(
+            provider.token_url,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    if response.status_code != 200:
+        raise RuntimeError(f"Token exchange failed: {response.status_code} {response.text}")
+
+    payload = response.json()
+    access, refresh, expires_in = _parse_token_payload(
+        payload,
+        "Token response missing fields",
+    )
+    account_id = _decode_account_id(
+        access,
+        provider.jwt_claim_path,
+        provider.account_id_claim,
+    )
+    return OAuthToken(
+        access=access,
+        refresh=refresh,
+        expires=int(time.time() * 1000 + expires_in * 1000),
+        account_id=account_id,
+    )
+
+
+def _login_openai_codex_interactive(
+    *,
+    print_fn: Callable[[str], None],
+    prompt_fn: Callable[[str], str],
+    proxy: str | None = None,
+):
+    """Run Codex OAuth without leaving a cancellable stdin read pending.
+
+    ``oauth_cli_kit.login_oauth_interactive`` races the local browser callback
+    against a background ``stdin.readline``. On Windows that executor read
+    cannot be cancelled, and ``asyncio.run`` can hang while shutting down its
+    default executor after the token exchange completes. Keep the same browser
+    callback flow, but only ask for manual input after the callback times out.
+    """
+    import threading
+    import urllib.parse
+    import webbrowser
+
+    from oauth_cli_kit.pkce import (
+        _create_state,
+        _generate_pkce,
+        _parse_authorization_input,
+    )
+    from oauth_cli_kit.providers import OPENAI_CODEX_PROVIDER
+    from oauth_cli_kit.server import _start_local_server
+    from oauth_cli_kit.storage import FileTokenStorage
+
+    provider = OPENAI_CODEX_PROVIDER
+
+    async def _login_async():
+        verifier, challenge = _generate_pkce()
+        state = _create_state()
+
+        params = {
+            "response_type": "code",
+            "client_id": provider.client_id,
+            "redirect_uri": provider.redirect_uri,
+            "scope": provider.scope,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            "id_token_add_organizations": "true",
+            "codex_cli_simplified_flow": "true",
+            "originator": provider.default_originator,
+        }
+        url = f"{provider.authorize_url}?{urllib.parse.urlencode(params)}"
+
+        loop = asyncio.get_running_loop()
+        code_future: asyncio.Future[str] = loop.create_future()
+
+        def _notify(code_value: str) -> None:
+            if code_future.done():
+                return
+            loop.call_soon_threadsafe(code_future.set_result, code_value)
+
+        server, server_error = _start_local_server(state, on_code=_notify)
+        print_fn("[cyan]A browser window will open for login. If it doesn't, open this URL manually:[/cyan]")
+        print_fn(url)
+        with suppress(Exception):
+            webbrowser.open(url)
+
+        if not server and server_error:
+            print_fn(
+                "[yellow]"
+                f"Local callback server could not start ({server_error}). "
+                "You will need to paste the callback URL or authorization code."
+                "[/yellow]"
+            )
+
+        code: str | None = None
+        try:
+            if server:
+                print_fn("[dim]Waiting for browser callback...[/dim]")
+                try:
+                    code = await asyncio.wait_for(
+                        code_future,
+                        timeout=_CODEX_OAUTH_CALLBACK_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    code = None
+
+            if not code:
+                raw = await loop.run_in_executor(
+                    None,
+                    prompt_fn,
+                    "Please paste the callback URL or authorization code:",
+                )
+                parsed_code, parsed_state = _parse_authorization_input(raw)
+                if parsed_state and parsed_state != state:
+                    raise RuntimeError("State validation failed.")
+                code = parsed_code
+
+            if not code:
+                raise RuntimeError("Authorization code not found.")
+
+            print_fn("[dim]Exchanging authorization code for tokens...[/dim]")
+            if proxy:
+                print_fn(f"[dim]Using proxy for token exchange: {proxy}[/dim]")
+            token = await asyncio.wait_for(
+                _exchange_openai_codex_code_for_token(
+                    code,
+                    verifier,
+                    provider,
+                    proxy=proxy,
+                ),
+                timeout=_CODEX_OAUTH_EXCHANGE_TIMEOUT_S + 5.0,
+            )
+            print_fn("[dim]Token exchange completed; saving credentials...[/dim]")
+            FileTokenStorage(token_filename=provider.token_filename).save(token)
+            return token
+        finally:
+            if server:
+                server.shutdown()
+                server.server_close()
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_login_async())
+
+    result: list[Any] = []
+    error: list[Exception] = []
+
+    def _runner() -> None:
+        try:
+            result.append(asyncio.run(_login_async()))
+        except Exception as exc:
+            error.append(exc)
+
+    thread = threading.Thread(target=_runner)
+    thread.start()
+    thread.join()
+    if error:
+        raise error[0]
+    return result[0]
+
+
+def _openai_codex_proxy_from_config() -> str | None:
+    try:
+        from nanobot.config.loader import load_config
+
+        return load_config().providers.openai_codex.proxy or None
+    except Exception as exc:
+        logger.debug("Could not load OpenAI Codex proxy config: {}", exc)
+        return None
 
 
 @provider_app.command("login")
@@ -1810,16 +2011,21 @@ def provider_logout(
 @_register_login("openai_codex")
 def _login_openai_codex() -> None:
     try:
-        from oauth_cli_kit import get_token, login_oauth_interactive
+        from oauth_cli_kit import get_token
 
+        from nanobot.providers.openai_codex_provider import _codex_oauth_proxy_env
+
+        proxy = _openai_codex_proxy_from_config()
         token = None
         with suppress(Exception):
-            token = get_token()
+            with _codex_oauth_proxy_env(proxy):
+                token = get_token()
         if not (token and token.access):
             console.print("[cyan]Starting interactive OAuth login...[/cyan]\n")
-            token = login_oauth_interactive(
+            token = _login_openai_codex_interactive(
                 print_fn=lambda s: console.print(s),
                 prompt_fn=lambda s: typer.prompt(s),
+                proxy=proxy,
             )
         if not (token and token.access):
             console.print("[red]✗ Authentication failed[/red]")

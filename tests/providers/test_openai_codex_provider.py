@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,6 +11,7 @@ from loguru import logger
 
 import nanobot.providers.base as provider_base
 from nanobot.providers.openai_codex_provider import (
+    _CODEX_OAUTH_PROXY_ENV_VARS,
     OpenAICodexProvider,
     _build_reasoning_options,
     _codex_error_response,
@@ -77,9 +79,17 @@ async def test_codex_request_non_200_populates_http_metadata(monkeypatch) -> Non
             request=request,
         )
 
-    def fake_client(*, timeout: int, verify: bool) -> httpx.AsyncClient:
+    def fake_client(
+        *,
+        timeout: int,
+        verify: bool,
+        proxy: str | None = None,
+        trust_env: bool = True,
+    ) -> httpx.AsyncClient:
         assert timeout == 90
         assert verify is True
+        assert proxy is None
+        assert trust_env is True
         return original_client(transport=httpx.MockTransport(handler), timeout=timeout)
 
     monkeypatch.setattr("nanobot.providers.openai_codex_provider.httpx.AsyncClient", fake_client)
@@ -106,8 +116,16 @@ async def test_codex_request_honors_stream_idle_timeout_env(monkeypatch) -> None
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, request=request)
 
-    def fake_client(*, timeout: int, verify: bool) -> httpx.AsyncClient:
+    def fake_client(
+        *,
+        timeout: int,
+        verify: bool,
+        proxy: str | None = None,
+        trust_env: bool = True,
+    ) -> httpx.AsyncClient:
         seen["timeout"] = timeout
+        assert proxy is None
+        assert trust_env is True
         return original_client(transport=httpx.MockTransport(handler), timeout=timeout)
 
     monkeypatch.setattr("nanobot.providers.openai_codex_provider.httpx.AsyncClient", fake_client)
@@ -115,6 +133,39 @@ async def test_codex_request_honors_stream_idle_timeout_env(monkeypatch) -> None
     await _request_codex("https://codex.example/responses", {}, {"input": []}, verify=True)
 
     assert seen["timeout"] == 5
+
+
+@pytest.mark.asyncio
+async def test_codex_request_uses_configured_proxy(monkeypatch) -> None:
+    original_client = httpx.AsyncClient
+    seen: dict[str, object] = {}
+    proxy = "http://127.0.0.1:23458"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request)
+
+    def fake_client(
+        *,
+        timeout: int,
+        verify: bool,
+        proxy: str | None = None,
+        trust_env: bool = True,
+    ) -> httpx.AsyncClient:
+        seen["proxy"] = proxy
+        seen["trust_env"] = trust_env
+        return original_client(transport=httpx.MockTransport(handler), timeout=timeout)
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.httpx.AsyncClient", fake_client)
+
+    await _request_codex(
+        "https://codex.example/responses",
+        {},
+        {"input": []},
+        verify=True,
+        proxy=proxy,
+    )
+
+    assert seen == {"proxy": proxy, "trust_env": False}
 
 
 @pytest.mark.asyncio
@@ -128,11 +179,12 @@ async def test_codex_prompt_cache_key_uses_stable_conversation_prefix(monkeypatc
         headers,
         body,
         verify,
+        proxy=None,
         on_content_delta=None,
         on_thinking_delta=None,
         on_tool_call_delta=None,
     ):
-        _ = on_thinking_delta, on_tool_call_delta
+        _ = proxy, on_thinking_delta, on_tool_call_delta
         bodies.append(body)
         return "ok", [], "stop", {}, None
 
@@ -184,6 +236,96 @@ async def test_codex_timeout_error_is_typed_and_retryable(monkeypatch) -> None:
     )
     assert response.error_kind == "timeout"
     assert response.error_should_retry is True
+
+
+@pytest.mark.asyncio
+async def test_codex_oauth_error_is_actionable_and_not_fallbackable(monkeypatch) -> None:
+    def fake_token():
+        raise RuntimeError(
+            'Token refresh failed: 401 {"error":{"code":"refresh_token_reused"}}'
+        )
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_token)
+
+    async def fake_request(*args: Any, **kwargs: Any):
+        raise AssertionError("Codex request should not run when OAuth token loading fails")
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+
+    provider = OpenAICodexProvider()
+    response = await provider.chat([{"role": "user", "content": "hello"}])
+
+    assert response.finish_reason == "error"
+    assert response.error_kind == "authentication"
+    assert response.error_should_retry is False
+    assert "Error calling Codex (CodexOAuthError)" in response.content
+    assert "nanobot provider logout openai-codex" in response.content
+    assert "nanobot provider login openai-codex" in response.content
+    assert "refresh_token_reused" in response.content
+
+
+@pytest.mark.asyncio
+async def test_codex_oauth_network_error_stays_in_codex_error_path(monkeypatch) -> None:
+    def fake_token():
+        request = httpx.Request("POST", "https://auth.openai.com/oauth/token")
+        raise httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING]", request=request)
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_token)
+
+    provider = OpenAICodexProvider()
+    response = await provider.chat([{"role": "user", "content": "hello"}])
+
+    assert response.finish_reason == "error"
+    assert response.error_kind == "authentication"
+    assert response.error_should_retry is True
+    assert "Error calling Codex (CodexOAuthError)" in response.content
+    assert "Error calling LLM" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_uses_proxy_for_oauth_and_response_request(monkeypatch) -> None:
+    proxy = "http://127.0.0.1:23458"
+    original_env = {
+        name: f"http://original-{name.lower()}.example:8080"
+        for name in _CODEX_OAUTH_PROXY_ENV_VARS
+    }
+    for name, value in original_env.items():
+        monkeypatch.setenv(name, value)
+
+    seen: dict[str, object] = {}
+
+    def fake_token():
+        seen["oauth_env"] = {
+            name: os.environ.get(name) for name in _CODEX_OAUTH_PROXY_ENV_VARS
+        }
+        return SimpleNamespace(account_id="acct", access="token")
+
+    async def fake_request(
+        url,
+        headers,
+        body,
+        verify,
+        proxy=None,
+        on_content_delta=None,
+        on_thinking_delta=None,
+        on_tool_call_delta=None,
+    ):
+        _ = url, headers, body, verify, on_content_delta, on_thinking_delta, on_tool_call_delta
+        seen["request_proxy"] = proxy
+        return "ok", [], "stop", {}, None
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider.get_codex_token", fake_token)
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+
+    provider = OpenAICodexProvider(proxy=proxy)
+    response = await provider.chat([{"role": "user", "content": "hello"}])
+
+    assert response.content == "ok"
+    assert seen["oauth_env"] == {name: proxy for name in _CODEX_OAUTH_PROXY_ENV_VARS}
+    assert seen["request_proxy"] == proxy
+    assert {
+        name: os.environ.get(name) for name in _CODEX_OAUTH_PROXY_ENV_VARS
+    } == original_env
 
 
 @pytest.mark.asyncio
@@ -419,11 +561,12 @@ async def test_codex_stream_surfaces_reasoning_summary(monkeypatch) -> None:
         headers,
         body,
         verify,
+        proxy=None,
         on_content_delta=None,
         on_thinking_delta=None,
         on_tool_call_delta=None,
     ):
-        _ = url, headers, verify, on_tool_call_delta
+        _ = url, headers, verify, proxy, on_tool_call_delta
         assert body["reasoning"] == {"summary": "auto", "effort": "medium"}
         if on_content_delta:
             await on_content_delta("answer")

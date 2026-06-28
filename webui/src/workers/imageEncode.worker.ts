@@ -207,9 +207,14 @@ export async function encodeImageInWorker(
 
   const head = new Uint8Array(buffer.slice(0, 12));
   const sniffed = sniffImageMime(head);
-  if (!sniffed) return { id, ok: false, reason: "magic_mismatch" };
+  if (!sniffed) {
+      // Non-image file: pass through as data URL using the already-read buffer
+      const mt = file.type || "application/octet-stream";
+      const b64 = bufferToBase64(buffer);
+      return { id, ok: true, dataUrl: `data:${mt};base64,${b64}`, mime: mt, bytes: file.size, origBytes: file.size, normalized: false };
+    }
   if (!SUPPORTED_MIMES.has(sniffed)) {
-    return { id, ok: false, reason: "invalid_mime" };
+    // allow all mime types
   }
   // Defend against MIME spoofing: the declared ``file.type`` can lie.
   if (file.type && SUPPORTED_MIMES.has(file.type) && file.type !== sniffed) {

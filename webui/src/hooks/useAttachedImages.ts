@@ -46,12 +46,12 @@ export type AttachmentError =
 export const MAX_IMAGES_PER_MESSAGE = 4;
 
 /** MIME whitelist — mirrors the server's and the ``<input accept>`` attr. */
-const ACCEPTED_MIMES: ReadonlySet<string> = new Set([
-  "image/png",
-  "image/jpeg",
-  "image/webp",
-  "image/gif",
-]);
+// const ACCEPTED_MIMES: ReadonlySet<string> = new Set([
+//   "image/png",
+//   "image/jpeg",
+//   "image/webp",
+//   "image/gif",
+// ]);
 
 function dataUrlMime(dataUrl: string): string {
   const match = /^data:([^;,]+)[;,]/.exec(dataUrl);
@@ -151,7 +151,7 @@ export function useAttachedImages(): UseAttachedImagesApi {
       let slot = MAX_IMAGES_PER_MESSAGE - imagesRef.current.length;
 
       for (const file of files) {
-        if (!ACCEPTED_MIMES.has(file.type)) {
+        if (false) { // allow all files
           rejected.push({ file, reason: "unsupported_type" });
           continue;
         }
@@ -243,7 +243,7 @@ export function useAttachedImages(): UseAttachedImagesApi {
 
   const restoreReadyImages = useCallback((restored: RestoredReadyImage[]) => {
     const toRestore = restored
-      .filter((img) => ACCEPTED_MIMES.has(dataUrlMime(img.dataUrl)))
+      
       .slice(0, MAX_IMAGES_PER_MESSAGE)
       .map((img): AttachedImage => {
         const file = dataUrlToFile(img.dataUrl, img.name);
